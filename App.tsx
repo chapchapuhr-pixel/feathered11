@@ -52,6 +52,7 @@ import { SearchPage } from './components/SearchPage';
 import Dashboard from './components/Dashboard';
 import AdCreator from './components/AdCreator';
 import AdsManager from './components/AdsManager';
+import { moderateUser } from './lib/moderation';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { 
   faChartLine, 
@@ -8938,68 +8939,100 @@ useEffect(() => {
     
   // ===== ADMIN FUNCTIONS ====
   const verifyUser = useCallback(
-    async (userId: number) => {
+    async (userId: number, forceAction?: 'verify' | 'unverify') => {
       if (!requireAdmin('Verify user')) return;
-
-      setUsers((prev) =>
-        prev.map((u: any) =>
-          Number(u.id) === Number(userId) ? { ...u, is_verified: u.is_verified ? 0 : 1 } : u
-        )
-      );
+      const targetUser = users.find((u) => Number(u.id) === Number(userId));
+      const action = forceAction || (targetUser?.is_verified ? 'unverify' : 'verify');
 
       try {
-        await apiFetch('/api/admin/users/verify', {
-          method: 'POST',
-          body: JSON.stringify({ user_id: Number(userId) }),
-        });
-
-        await fetchUsersList();
+        const res = await moderateUser(Number(currentUser?.id), Number(userId), action);
+        if (res.success) {
+          setUsers((prev) =>
+            prev.map((u: any) =>
+              Number(u.id) === Number(userId)
+                ? { ...u, is_verified: res.is_verified ?? (action === 'verify' ? 1 : 0) }
+                : u
+            )
+          );
+          await fetchUsersList();
+          return res;
+        } else {
+          setLoginError(res.error || 'Verification failed');
+        }
       } catch (e: any) {
         await fetchUsersList();
         setLoginError(e?.message || 'Verify failed');
       }
     },
-    [requireAdmin, fetchUsersList]
+    [requireAdmin, currentUser, users, fetchUsersList]
   );
 
   const suspendUser = useCallback(
-    async (userId: number, duration: '24h' | '5d' | '30d' | 'manual') => {
+    async (
+      userId: number,
+      duration: 'week' | 'month' | 'until_unsuspend' | '24h' | '5d' | '30d' | 'manual' = 'week',
+      reason?: string
+    ) => {
       if (!requireModOrAdmin('Suspend user')) return;
 
+      const mappedDuration: 'week' | 'month' | 'until_unsuspend' =
+        duration === 'month' || duration === '30d'
+          ? 'month'
+          : duration === 'until_unsuspend' || duration === 'manual'
+          ? 'until_unsuspend'
+          : 'week';
+
       try {
-        await apiFetch('/api/admin/users/suspend', {
-          method: 'POST',
-          body: JSON.stringify({ user_id: Number(userId), duration }),
+        const res = await moderateUser(Number(currentUser?.id), Number(userId), 'suspend', {
+          duration: mappedDuration,
+          reason: reason || 'Suspended by admin',
         });
 
-        await fetchUsersList();
+        if (res.success) {
+          setUsers((prev) =>
+            prev.map((u: any) =>
+              Number(u.id) === Number(userId)
+                ? {
+                    ...u,
+                    suspended_until: res.suspended_until,
+                    suspension_reason: res.reason,
+                    posting_disabled: true,
+                  }
+                : u
+            )
+          );
+          await fetchUsersList();
+          return res;
+        } else {
+          setLoginError(res.error || 'Suspend failed');
+        }
       } catch (e: any) {
         setLoginError(e?.message || 'Suspend failed');
       }
     },
-    [requireModOrAdmin, fetchUsersList]
+    [requireModOrAdmin, currentUser, fetchUsersList]
   );
 
   const deleteUserAccount = useCallback(
     async (userId: number) => {
       if (!requireAdmin('Delete account')) return;
 
-      setUsers((prev) => prev.filter((u: any) => Number(u.id) !== Number(userId)));
-
       try {
-        await apiFetch('/api/admin/users/delete', {
-          method: 'DELETE',
-          body: JSON.stringify({ user_id: Number(userId) }),
-        });
-
-        await fetchUsersList();
-        fetchPostsForHome(currentUser).catch(() => {});
+        const res = await moderateUser(Number(currentUser?.id), Number(userId), 'delete');
+        if (res.success) {
+          setUsers((prev) => prev.filter((u: any) => Number(u.id) !== Number(userId)));
+          await fetchUsersList();
+          fetchPostsForHome(currentUser).catch(() => {});
+          return res;
+        } else {
+          setLoginError(res.error || 'Delete failed');
+        }
       } catch (e: any) {
         await fetchUsersList();
         setLoginError(e?.message || 'Delete failed');
       }
     },
-    [requireAdmin, fetchUsersList, fetchPostsForHome, currentUser]
+    [requireAdmin, currentUser, fetchUsersList, fetchPostsForHome]
   );
 
   const setModeratorRole = useCallback(
@@ -9007,17 +9040,24 @@ useEffect(() => {
       if (!requireAdmin('Change user role')) return;
 
       try {
-        await apiFetch('/api/admin/users/role', {
-          method: 'POST',
-          body: JSON.stringify({ user_id: Number(userId), role }),
-        });
-
-        await fetchUsersList();
+        const action = role === 'moderator' ? 'make_moderator' : 'remove_moderator';
+        const res = await moderateUser(Number(currentUser?.id), Number(userId), action);
+        if (res.success) {
+          setUsers((prev) =>
+            prev.map((u: any) =>
+              Number(u.id) === Number(userId) ? { ...u, role: res.role || role } : u
+            )
+          );
+          await fetchUsersList();
+          return res;
+        } else {
+          setLoginError(res.error || 'Role change failed');
+        }
       } catch (e: any) {
         setLoginError(e?.message || 'Role change failed');
       }
     },
-    [requireAdmin, fetchUsersList]
+    [requireAdmin, currentUser, fetchUsersList]
   );
 
   const handleHashtagClick = useCallback((tag: string) => {

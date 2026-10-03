@@ -837,6 +837,47 @@ function apiDevPlugin(): Plugin {
           return res.end(JSON.stringify({ success: true, comments: [] }));
         }
 
+        if (pathname === '/api/users/moderate') {
+          let body = '';
+          req.on('data', (chunk) => { body += chunk; });
+          return req.on('end', () => {
+            try {
+              const parsed = JSON.parse(body || '{}');
+              const action = parsed.action;
+              const targetUserId = parsed.user_id;
+              if (action === 'verify') {
+                return res.end(JSON.stringify({ success: true, action: 'verify', user_id: targetUserId, is_verified: 1 }));
+              }
+              if (action === 'unverify') {
+                return res.end(JSON.stringify({ success: true, action: 'unverify', user_id: targetUserId, is_verified: 0 }));
+              }
+              if (action === 'suspend') {
+                const duration = parsed.duration || 'week';
+                const days = duration === 'month' ? 30 : duration === 'week' ? 7 : 36500;
+                const expiresAt = (duration === 'indefinite' || duration === 'forever' || duration === 'until_unsuspend')
+                  ? '9999-12-31 23:59:59'
+                  : new Date(Date.now() + days * 86400000).toISOString().replace('T', ' ').slice(0, 19);
+                return res.end(JSON.stringify({ success: true, action: 'suspend', user_id: targetUserId, suspended_until: expiresAt, reason: parsed.reason || 'Suspended', soft_deleted: true }));
+              }
+              if (action === 'unsuspend') {
+                return res.end(JSON.stringify({ success: true, action: 'unsuspend', user_id: targetUserId }));
+              }
+              if (action === 'delete') {
+                return res.end(JSON.stringify({ success: true, action: 'delete', user_id: targetUserId, suspended_until: '9999-12-31 23:59:59', reason: 'Account deleted', soft_deleted: true }));
+              }
+              if (action === 'make_moderator' || action === 'moderator') {
+                return res.end(JSON.stringify({ success: true, action: 'make_moderator', user_id: targetUserId, role: 'moderator' }));
+              }
+              if (action === 'remove_moderator') {
+                return res.end(JSON.stringify({ success: true, action: 'remove_moderator', user_id: targetUserId, role: 'user' }));
+              }
+              return res.end(JSON.stringify({ success: true, action, user_id: targetUserId }));
+            } catch {
+              return res.end(JSON.stringify({ success: true }));
+            }
+          });
+        }
+
         if (pathname === '/api/users') {
           res.statusCode = 200;
           return res.end(JSON.stringify([]));

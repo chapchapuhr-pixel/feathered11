@@ -4,6 +4,7 @@ import { User, Post as PostType, ReactionType, Reel, AudioTrack, Product, Group,
 import { ChatsList } from './ChatsList';
 import { MarketplaceContext } from '../App';
 import { VerifiedBadge } from './VerifiedBadge';
+import { moderateUser, ModerationAction, ModerationExtra } from '../lib/moderation';
 
 // Import from Feed.tsx
 import {
@@ -402,9 +403,181 @@ export const UserProfile: React.FC<UserProfileProps> = ({
 
   // Role checks
   const roleOf = (u: any) => String(u?.role || "").trim().toLowerCase();
-  const isAdmin = currentUser ? roleOf(currentUser) === "admin" : false;
+  const isAdmin = currentUser ? ["admin", "superadmin"].includes(roleOf(currentUser)) : false;
   const isModerator = currentUser ? roleOf(currentUser) === "moderator" : false;
   const isAdminOrModerator = isAdmin || isModerator;
+
+  // Target user state for immediate reactivity on moderation
+  const [targetUser, setTargetUser] = useState<User>(user);
+  useEffect(() => {
+    setTargetUser(user);
+  }, [user]);
+
+  // Admin moderation dropdown & modal states
+  const [showAdminDropdown, setShowAdminDropdown] = useState(false);
+  const [adminActionLoading, setAdminActionLoading] = useState<string | null>(null);
+  const [moderationToast, setModerationToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showSuspendModal, setShowSuspendModal] = useState<{ open: boolean; duration: 'week' | 'month' | 'until_unsuspend'; title: string } | null>(null);
+  const [suspendReason, setSuspendReason] = useState('Spam');
+  const adminMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close admin menu when clicking outside
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (adminMenuRef.current && !adminMenuRef.current.contains(e.target as Node)) {
+        setShowAdminDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, []);
+
+  // Auto-dismiss moderation toast
+  useEffect(() => {
+    if (moderationToast) {
+      const timer = setTimeout(() => setModerationToast(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [moderationToast]);
+
+  const isSuspended = Boolean(
+    targetUser?.suspended_until &&
+    new Date(targetUser.suspended_until).getTime() > Date.now()
+  );
+  const isSoftDeleted = Boolean(
+    targetUser?.suspended_until &&
+    String(targetUser.suspended_until).startsWith('9999')
+  );
+  const isVerified = Boolean((targetUser as any)?.is_verified);
+  const isTargetModerator = targetUser?.role === 'moderator';
+
+  const handleModerate = async (
+    action: ModerationAction,
+    extra: ModerationExtra = {}
+  ) => {
+    if (!currentUser?.id) {
+      setModerationToast({ message: "Login required to perform moderation actions", type: "error" });
+      return;
+    }
+    if (isSelf) {
+      setModerationToast({ message: "Cannot moderate yourself", type: "error" });
+      return;
+    }
+
+    const actionKey = action + (extra.duration ? `_${extra.duration}` : "");
+    setAdminActionLoading(actionKey);
+
+    try {
+      const res = await moderateUser(
+        Number(currentUser.id),
+        Number(targetUser.id),
+        action,
+        extra
+      );
+
+      if (res.success) {
+        if (action === "verify") {
+          setTargetUser((prev) => ({ ...prev, is_verified: true as any }));
+          setModerationToast({ message: "✓ User verified successfully (Blue badge awarded)", type: "success" });
+          onVerifyUser?.(targetUser.id);
+          onUpdateUserDetails?.({ is_verified: true as any });
+        } else if (action === "unverify") {
+          setTargetUser((prev) => ({ ...prev, is_verified: false as any }));
+          setModerationToast({ message: "Verification badge removed", type: "info" });
+          onVerifyUser?.(targetUser.id);
+          onUpdateUserDetails?.({ is_verified: false as any });
+        } else if (action === "suspend") {
+          setTargetUser((prev) => ({
+            ...prev,
+            suspended_until: res.suspended_until,
+            suspension_reason: res.reason,
+            posting_disabled: true,
+          }));
+          const durLabel =
+            extra.duration === "week"
+              ? "1 week"
+              : extra.duration === "month"
+              ? "1 month"
+              : "indefinitely until manually unsuspended";
+          setModerationToast({
+            message: `User suspended for ${durLabel}`,
+            type: "success",
+          });
+          onRestrictUser?.(
+            targetUser.id,
+            extra.duration === "month" ? "30d" : extra.duration === "week" ? "5d" : "manual"
+          );
+          onUpdateUserDetails?.({
+            suspended_until: res.suspended_until,
+            suspension_reason: res.reason,
+            posting_disabled: true,
+          });
+        } else if (action === "unsuspend") {
+          setTargetUser((prev) => ({
+            ...prev,
+            suspended_until: null,
+            suspension_reason: null,
+            posting_disabled: false,
+          }));
+          setModerationToast({
+            message: "User unsuspended successfully. Account active ⏯️",
+            type: "success",
+          });
+          onUpdateUserDetails?.({
+            suspended_until: null,
+            suspension_reason: null,
+            posting_disabled: false,
+          });
+        } else if (action === "delete") {
+          setTargetUser((prev) => ({
+            ...prev,
+            suspended_until: res.suspended_until || "9999-12-31 23:59:59",
+            suspension_reason: "Account deleted",
+            posting_disabled: true,
+          }));
+          setModerationToast({
+            message: "User account deleted (Permanent soft delete) 🗑️",
+            type: "success",
+          });
+          onDeleteUser?.(targetUser.id);
+        } else if (action === "make_moderator") {
+          setTargetUser((prev) => ({ ...prev, role: "moderator" }));
+          setModerationToast({
+            message: "User promoted to Moderator 🛡️",
+            type: "success",
+          });
+          onMakeModerator?.(targetUser.id, true);
+          onUpdateUserDetails?.({ role: "moderator" });
+        } else if (action === "remove_moderator") {
+          setTargetUser((prev) => ({ ...prev, role: "user" }));
+          setModerationToast({
+            message: "Moderator role removed",
+            type: "info",
+          });
+          onMakeModerator?.(targetUser.id, false);
+          onUpdateUserDetails?.({ role: "user" });
+        }
+
+        setShowAdminDropdown(false);
+        setShowSuspendModal(null);
+        setShowDeleteConfirm(false);
+      } else {
+        setModerationToast({
+          message: res.error || "Action failed. Please check permissions.",
+          type: "error",
+        });
+      }
+    } catch (err: any) {
+      console.error("Moderation error:", err);
+      setModerationToast({
+        message: err?.message || "Server error occurred",
+        type: "error",
+      });
+    } finally {
+      setAdminActionLoading(null);
+    }
+  };
 
   const profileInputRef = useRef<HTMLInputElement>(null);
   const coverInputRef = useRef<HTMLInputElement>(null);
@@ -1839,12 +2012,212 @@ export const UserProfile: React.FC<UserProfileProps> = ({
                 </div>
                 
                 <div className="flex-1 min-w-0 pb-2">
-                  <h1 className="text-[28px] md:text-[32px] leading-tight font-extrabold text-[#F8FAFC] flex items-center gap-2 truncate">
-                    {safeStringHelper((user as any).name, "User")}
-                    {Boolean((user as any)?.is_verified) && (
-                      <VerifiedBadge size={28} className="flex-shrink-0" />
+                  <div className="flex items-center gap-2.5 flex-wrap">
+                    {/* Admin Actions Trigger Button - In front of name, ONLY seen by admin/moderator profiles */}
+                    {isAdminOrModerator && (
+                      <div className="relative inline-block" ref={adminMenuRef}>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowAdminDropdown((prev) => !prev);
+                          }}
+                          className={`group flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold transition-all shadow-sm border ${
+                            showAdminDropdown
+                              ? "bg-red-600 text-white border-red-500 shadow-md ring-2 ring-red-400/40"
+                              : isSuspended
+                              ? "bg-red-950 text-red-300 border-red-800 hover:bg-red-900"
+                              : "bg-[#1E293B] text-red-400 border-red-900/60 hover:bg-[#28374D] hover:text-red-300"
+                          } ${isSelf ? "opacity-75 cursor-not-allowed" : "active:scale-95"}`}
+                          title={isSelf ? "Cannot moderate yourself" : "Admin Moderation Actions"}
+                        >
+                          <i className="fas fa-shield-alt text-xs text-red-400 group-hover:text-red-300"></i>
+                          {/* Three buttons / dots icon representation */}
+                          <span className="flex items-center gap-0.5 px-0.5" title="Three dots action menu">
+                            <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
+                            <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
+                            <span className="w-1.5 h-1.5 rounded-full bg-current"></span>
+                          </span>
+                          <span className="font-bold tracking-wider uppercase text-[11px]">Admin</span>
+                          <i className={`fas fa-chevron-down text-[9px] transition-transform duration-200 ${showAdminDropdown ? "rotate-180" : ""}`}></i>
+                        </button>
+
+                        {/* Dropdown Menu below */}
+                        {showAdminDropdown && (
+                          <div
+                            className="absolute left-0 top-full mt-2 w-72 sm:w-80 bg-[#0F172A] border border-red-600/40 rounded-2xl shadow-2xl p-3 z-50 text-left backdrop-blur-xl"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#1E293B]">
+                              <div className="flex items-center gap-1.5">
+                                <i className="fas fa-shield-alt text-red-400 text-xs"></i>
+                                <span className="text-xs font-extrabold text-[#F8FAFC]">Admin Moderation</span>
+                              </div>
+                              <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800/40">
+                                {targetUser.role || "user"}
+                              </span>
+                            </div>
+
+                            {isSelf ? (
+                              <div className="p-2.5 rounded-lg bg-yellow-950/30 border border-yellow-800/40 text-yellow-300 text-xs">
+                                <i className="fas fa-info-circle mr-1.5"></i>
+                                You cannot moderate your own account.
+                              </div>
+                            ) : (
+                              <div className="flex flex-col gap-1.5">
+                                {/* 1. Verify Profile / Unverify */}
+                                <button
+                                  type="button"
+                                  disabled={adminActionLoading !== null || (!isAdmin && isVerified)}
+                                  onClick={() => handleModerate(isVerified ? "unverify" : "verify")}
+                                  className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold transition-all ${
+                                    isVerified
+                                      ? "bg-slate-800/90 text-amber-300 hover:bg-slate-700 border border-amber-500/40"
+                                      : "bg-[#1877F2]/20 text-[#2D88FF] hover:bg-[#1877F2]/30 border border-[#1877F2]/40"
+                                  }`}
+                                >
+                                  <span className="flex items-center gap-2">
+                                    <i className={isVerified ? "fas fa-times-circle text-amber-400" : "fas fa-check-circle text-blue-400"}></i>
+                                    {isVerified ? "Unverify Profile" : "Verify Profile"}
+                                  </span>
+                                  {adminActionLoading === "verify" || adminActionLoading === "unverify" ? (
+                                    <i className="fas fa-spinner fa-spin text-xs"></i>
+                                  ) : (
+                                    <span className="text-[10px] opacity-75 font-normal">{isVerified ? "Remove badge" : "Give blue badge"}</span>
+                                  )}
+                                </button>
+
+                                {/* 2. Suspend for Week */}
+                                {!isSuspended ? (
+                                  <button
+                                    type="button"
+                                    disabled={adminActionLoading !== null}
+                                    onClick={() => setShowSuspendModal({ open: true, duration: "week", title: "Suspend for 1 Week" })}
+                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold bg-yellow-950/30 text-yellow-300 hover:bg-yellow-900/40 border border-yellow-700/40 transition-all"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <i className="fas fa-pause text-yellow-400"></i>
+                                      Suspend Profile for Week
+                                    </span>
+                                    <span className="text-[10px] opacity-75 font-normal">7 days</span>
+                                  </button>
+                                ) : null}
+
+                                {/* 3. Suspend for Month */}
+                                {!isSuspended ? (
+                                  <button
+                                    type="button"
+                                    disabled={adminActionLoading !== null}
+                                    onClick={() => setShowSuspendModal({ open: true, duration: "month", title: "Suspend for 1 Month" })}
+                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold bg-amber-950/30 text-amber-300 hover:bg-amber-900/40 border border-amber-700/40 transition-all"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <i className="fas fa-calendar-times text-amber-400"></i>
+                                      Suspend Profile for Month
+                                    </span>
+                                    <span className="text-[10px] opacity-75 font-normal">30 days</span>
+                                  </button>
+                                ) : null}
+
+                                {/* 4. Suspend until unsuspend */}
+                                {!isSuspended ? (
+                                  <button
+                                    type="button"
+                                    disabled={adminActionLoading !== null}
+                                    onClick={() => setShowSuspendModal({ open: true, duration: "until_unsuspend", title: "Suspend until Unsuspend" })}
+                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold bg-orange-950/30 text-orange-300 hover:bg-orange-900/40 border border-orange-700/40 transition-all"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <i className="fas fa-ban text-orange-400"></i>
+                                      Suspended until unsuspend
+                                    </span>
+                                    <span className="text-[10px] opacity-75 font-normal">Indefinite</span>
+                                  </button>
+                                ) : (
+                                  /* Unsuspend button when suspended */
+                                  <button
+                                    type="button"
+                                    disabled={adminActionLoading !== null}
+                                    onClick={() => handleModerate("unsuspend")}
+                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-950/40 text-emerald-300 hover:bg-emerald-900/50 border border-emerald-600/50 transition-all shadow-sm"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <i className="fas fa-play text-emerald-400"></i>
+                                      Unsuspend Profile
+                                    </span>
+                                    {adminActionLoading === "unsuspend" ? (
+                                      <i className="fas fa-spinner fa-spin text-xs"></i>
+                                    ) : (
+                                      <span className="text-[10px] opacity-80 font-normal">Restore user</span>
+                                    )}
+                                  </button>
+                                )}
+
+                                {/* 5. Make moderator / Remove moderator */}
+                                {isAdmin && (
+                                  <button
+                                    type="button"
+                                    disabled={adminActionLoading !== null}
+                                    onClick={() => handleModerate(isTargetModerator ? "remove_moderator" : "make_moderator")}
+                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold bg-purple-950/30 text-purple-300 hover:bg-purple-900/40 border border-purple-700/40 transition-all"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <i className={isTargetModerator ? "fas fa-user-minus text-purple-300" : "fas fa-shield-alt text-purple-400"}></i>
+                                      {isTargetModerator ? "Remove Moderator" : "Make Moderator"}
+                                    </span>
+                                    {adminActionLoading === "make_moderator" || adminActionLoading === "remove_moderator" ? (
+                                      <i className="fas fa-spinner fa-spin text-xs"></i>
+                                    ) : (
+                                      <span className="text-[10px] opacity-75 font-normal">{isTargetModerator ? "Demote to user" : "Assign mod role"}</span>
+                                    )}
+                                  </button>
+                                )}
+
+                                {/* 6. Delete profile */}
+                                {isAdmin && (
+                                  <button
+                                    type="button"
+                                    disabled={adminActionLoading !== null}
+                                    onClick={() => setShowDeleteConfirm(true)}
+                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-semibold bg-red-950/40 text-red-300 hover:bg-red-900/50 border border-red-700/50 transition-all"
+                                  >
+                                    <span className="flex items-center gap-2">
+                                      <i className="fas fa-trash-alt text-red-400"></i>
+                                      Delete Profile
+                                    </span>
+                                    <span className="text-[10px] opacity-75 font-normal">Soft delete</span>
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     )}
-                  </h1>
+
+                    {/* The User Name */}
+                    <h1 className="text-[28px] md:text-[32px] leading-tight font-extrabold text-[#F8FAFC] flex items-center gap-2 truncate">
+                      {safeStringHelper((targetUser as any).name, "User")}
+                      {isVerified && (
+                        <VerifiedBadge size={28} className="flex-shrink-0" />
+                      )}
+                      {targetUser?.role === 'moderator' && (
+                        <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-purple-900/60 text-purple-300 border border-purple-700/50 font-bold flex-shrink-0">
+                          <i className="fas fa-shield-alt text-[10px]"></i> Mod
+                        </span>
+                      )}
+                      {targetUser?.role === 'admin' && (
+                        <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-red-900/60 text-red-300 border border-red-700/50 font-bold flex-shrink-0">
+                          <i className="fas fa-user-shield text-[10px]"></i> Admin
+                        </span>
+                      )}
+                      {isSuspended && (
+                        <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-red-950 text-red-300 border border-red-800 font-bold flex-shrink-0">
+                          <i className="fas fa-ban text-[10px]"></i> Suspended
+                        </span>
+                      )}
+                    </h1>
+                  </div>
                   
                   {/* Stats Row - Following removed */}
                   <div className="text-[#F8FAFC] text-[16px] md:text-[17px] mt-1 leading-snug">
@@ -1990,6 +2363,39 @@ export const UserProfile: React.FC<UserProfileProps> = ({
                 </div>
               )}
 
+              {/* Suspension / Deleted Status Banner */}
+              {isSuspended && (
+                <div className="mt-4 rounded-xl border border-red-700/60 bg-red-950/80 p-3.5 text-red-200 shadow-md">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-2.5">
+                      <i className="fas fa-exclamation-triangle text-red-400 text-lg flex-shrink-0"></i>
+                      <div>
+                        <p className="font-bold text-sm text-white">
+                          {isSoftDeleted ? "Account is Deleted (Soft Delete)" : "Account is Currently Suspended"}
+                        </p>
+                        <p className="text-xs text-red-300/90 mt-0.5">
+                          {targetUser.suspended_until && !isSoftDeleted && (
+                            <span>Expires: <strong>{targetUser.suspended_until}</strong> · </span>
+                          )}
+                          Reason: <em>{targetUser.suspension_reason || "Account suspended by administrator"}</em>
+                        </p>
+                      </div>
+                    </div>
+                    {isAdminOrModerator && !isSelf && (
+                      <button
+                        type="button"
+                        onClick={() => handleModerate("unsuspend")}
+                        disabled={adminActionLoading !== null}
+                        className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all shadow active:scale-95 flex items-center gap-1.5 flex-shrink-0"
+                      >
+                        <i className="fas fa-play text-xs"></i>
+                        Unsuspend Profile
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Tabs */}
               <div className="h-[8px] bg-[#1E293B] -mx-4 mt-5"></div>
               <div className="flex items-center justify-around overflow-x-auto whitespace-nowrap scrollbar-hide bg-[#0F172A] -mx-4 px-2">
@@ -2015,124 +2421,147 @@ export const UserProfile: React.FC<UserProfileProps> = ({
       {/* Admin/Moderator Controls */}
       {isAdminOrModerator && (
         <div className="max-w-[1095px] mx-auto mt-6 px-4">
-          <div className="bg-[#0F172A] rounded-xl p-4 shadow-sm border border-red-900/50">
-            <h2 className="text-xl font-bold text-red-500 mb-4">
-              {isAdmin ? 'Admin Controls' : 'Moderator Controls'}
-            </h2>
-            <div className="flex flex-col gap-2">
-              {isAdmin && (
-                <button
-                  disabled={isSelf}
-                  onClick={() => !isSelf && onVerifyUser?.(user.id)}
-                  className={`w-full py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
-                    isSelf
-                      ? "bg-[#263951]/40 text-[#2D88FF]/40 cursor-not-allowed"
-                      : "bg-[#263951] text-[#2D88FF] hover:bg-[#2A3F5A]"
-                  }`}
-                >
-                  {(user as any).is_verified ? 'Remove Verification' : 'Verify User'} {isSelf ? "(Self)" : ""}
-                </button>
-              )}
-              
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  disabled={isSelf}
-                  onClick={() => !isSelf && onRestrictUser?.(user.id, "24h")}
-                  className={`py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
-                    isSelf
-                      ? "bg-yellow-900/40 text-yellow-200/40 cursor-not-allowed"
-                      : "bg-yellow-900/80 text-yellow-200 hover:bg-yellow-800"
-                  }`}
-                >
-                  Suspend 24h {isSelf ? "(Self)" : ""}
-                </button>
-                <button
-                  disabled={isSelf}
-                  onClick={() => !isSelf && onRestrictUser?.(user.id, "5d")}
-                  className={`py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
-                    isSelf
-                      ? "bg-yellow-900/40 text-yellow-200/40 cursor-not-allowed"
-                      : "bg-yellow-900/80 text-yellow-200 hover:bg-yellow-800"
-                  }`}
-                >
-                  Suspend 5d {isSelf ? "(Self)" : ""}
-                </button>
-                <button
-                  disabled={isSelf}
-                  onClick={() => !isSelf && onRestrictUser?.(user.id, "30d")}
-                  className={`py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
-                    isSelf
-                      ? "bg-yellow-900/40 text-yellow-200/40 cursor-not-allowed"
-                      : "bg-yellow-900/80 text-yellow-200 hover:bg-yellow-800"
-                  }`}
-                >
-                  Suspend 30d {isSelf ? "(Self)" : ""}
-                </button>
-                <button
-                  disabled={isSelf}
-                  onClick={() => !isSelf && onRestrictUser?.(user.id, "manual")}
-                  className={`py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
-                    isSelf
-                      ? "bg-yellow-900/40 text-yellow-200/40 cursor-not-allowed"
-                      : "bg-yellow-900/80 text-yellow-200 hover:bg-yellow-800"
-                  }`}
-                >
-                  Suspend Manual {isSelf ? "(Self)" : ""}
-                </button>
+          <div className="bg-[#0F172A] rounded-2xl p-5 shadow-xl border border-red-900/50">
+            <div className="flex items-center justify-between pb-3 mb-4 border-b border-[#1E293B]">
+              <div className="flex items-center gap-2">
+                <i className="fas fa-shield-alt text-red-400 text-lg"></i>
+                <h2 className="text-lg font-bold text-red-400">
+                  {isAdmin ? 'Admin Moderation Controls' : 'Moderator Controls'}
+                </h2>
               </div>
+              <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-[#1E293B] text-[#94A3B8] border border-[#334155]">
+                Target Role: <span className="text-white capitalize">{targetUser.role || 'user'}</span>
+              </span>
+            </div>
 
-              {isAdmin && (
-                <div className="grid grid-cols-2 gap-2 mt-2">
+            <div className="flex flex-col gap-2.5">
+              {/* Verify / Unverify */}
+              <button
+                disabled={isSelf || adminActionLoading !== null || (!isAdmin && isVerified)}
+                onClick={() => !isSelf && handleModerate(isVerified ? 'unverify' : 'verify')}
+                className={`w-full py-2.5 px-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-sm ${
+                  isSelf
+                    ? "bg-[#263951]/30 text-[#2D88FF]/40 cursor-not-allowed border border-blue-900/20"
+                    : isVerified
+                    ? "bg-slate-800 text-amber-300 hover:bg-slate-700 border border-amber-500/40 active:scale-98"
+                    : "bg-[#1877F2] text-white hover:bg-[#166FE5] border border-blue-400/40 active:scale-98"
+                }`}
+              >
+                <i className={isVerified ? "fas fa-times-circle" : "fas fa-check-circle"}></i>
+                {isVerified ? 'Unverify Profile (Remove badge)' : 'Verify Profile (Give blue badge)'}
+                {isSelf ? " (Self)" : ""}
+              </button>
+              
+              {/* Suspend Options */}
+              {!isSuspended ? (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <button
-                    disabled={isSelf}
-                    onClick={() => !isSelf && onMakeModerator?.(user.id, true)}
-                    className={`py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
+                    disabled={isSelf || adminActionLoading !== null}
+                    onClick={() => !isSelf && setShowSuspendModal({ open: true, duration: "week", title: "Suspend for 1 Week" })}
+                    className={`py-2 px-3 rounded-xl font-semibold text-xs transition-all flex items-center justify-center gap-1.5 ${
                       isSelf
-                        ? "bg-[#1E293B]/40 text-[#F8FAFC]/40 cursor-not-allowed"
-                        : "bg-[#1E293B] text-[#F8FAFC] hover:bg-[#334155]"
+                        ? "bg-yellow-950/30 text-yellow-300/40 cursor-not-allowed border border-yellow-900/20"
+                        : "bg-yellow-950/60 text-yellow-200 hover:bg-yellow-900/70 border border-yellow-700/50 active:scale-98"
                     }`}
                   >
-                    Make Moderator {isSelf ? "(Self)" : ""}
+                    <i className="fas fa-pause text-yellow-400"></i>
+                    Suspend for Week (7d)
                   </button>
                   <button
-                    disabled={isSelf}
-                    onClick={() => !isSelf && onMakeModerator?.(user.id, false)}
-                    className={`py-2 rounded font-semibold transition-colors active:scale-95 active:shadow-inner ${
+                    disabled={isSelf || adminActionLoading !== null}
+                    onClick={() => !isSelf && setShowSuspendModal({ open: true, duration: "month", title: "Suspend for 1 Month" })}
+                    className={`py-2 px-3 rounded-xl font-semibold text-xs transition-all flex items-center justify-center gap-1.5 ${
                       isSelf
-                        ? "bg-[#1E293B]/40 text-[#F8FAFC]/40 cursor-not-allowed"
-                        : "bg-[#1E293B] text-[#F8FAFC] hover:bg-[#334155]"
+                        ? "bg-amber-950/30 text-amber-300/40 cursor-not-allowed border border-amber-900/20"
+                        : "bg-amber-950/60 text-amber-200 hover:bg-amber-900/70 border border-amber-700/50 active:scale-98"
                     }`}
                   >
-                    Remove Moderator {isSelf ? "(Self)" : ""}
+                    <i className="fas fa-calendar-times text-amber-400"></i>
+                    Suspend for Month (30d)
+                  </button>
+                  <button
+                    disabled={isSelf || adminActionLoading !== null}
+                    onClick={() => !isSelf && setShowSuspendModal({ open: true, duration: "until_unsuspend", title: "Suspend until Unsuspend" })}
+                    className={`py-2 px-3 rounded-xl font-semibold text-xs transition-all flex items-center justify-center gap-1.5 ${
+                      isSelf
+                        ? "bg-orange-950/30 text-orange-300/40 cursor-not-allowed border border-orange-900/20"
+                        : "bg-orange-950/60 text-orange-200 hover:bg-orange-900/70 border border-orange-700/50 active:scale-98"
+                    }`}
+                  >
+                    <i className="fas fa-ban text-orange-400"></i>
+                    Suspend until unsuspend
+                  </button>
+                </div>
+              ) : (
+                /* Unsuspend button */
+                <button
+                  disabled={isSelf || adminActionLoading !== null}
+                  onClick={() => !isSelf && handleModerate('unsuspend')}
+                  className={`w-full py-2.5 px-4 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-sm ${
+                    isSelf
+                      ? "bg-emerald-950/30 text-emerald-300/40 cursor-not-allowed border border-emerald-900/20"
+                      : "bg-emerald-600 text-white hover:bg-emerald-500 border border-emerald-400/40 active:scale-98"
+                  }`}
+                >
+                  <i className="fas fa-play"></i>
+                  Unsuspend Profile (Restore User Immediately)
+                </button>
+              )}
+
+              {/* Moderator Promotion / Demotion */}
+              {isAdmin && (
+                <div className="grid grid-cols-2 gap-2 mt-1">
+                  <button
+                    disabled={isSelf || adminActionLoading !== null || isTargetModerator}
+                    onClick={() => !isSelf && handleModerate('make_moderator')}
+                    className={`py-2 px-3 rounded-xl font-semibold text-xs transition-all flex items-center justify-center gap-1.5 ${
+                      isSelf || isTargetModerator
+                        ? "bg-purple-950/20 text-purple-300/40 cursor-not-allowed border border-purple-900/20"
+                        : "bg-purple-950/60 text-purple-200 hover:bg-purple-900/70 border border-purple-700/50 active:scale-98"
+                    }`}
+                  >
+                    <i className="fas fa-shield-alt text-purple-400"></i>
+                    Make Moderator {isTargetModerator ? "(Already Mod)" : ""}
+                  </button>
+                  <button
+                    disabled={isSelf || adminActionLoading !== null || !isTargetModerator}
+                    onClick={() => !isSelf && handleModerate('remove_moderator')}
+                    className={`py-2 px-3 rounded-xl font-semibold text-xs transition-all flex items-center justify-center gap-1.5 ${
+                      isSelf || !isTargetModerator
+                        ? "bg-slate-900/30 text-slate-400/40 cursor-not-allowed border border-slate-800/20"
+                        : "bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-600/50 active:scale-98"
+                    }`}
+                  >
+                    <i className="fas fa-user-minus text-slate-400"></i>
+                    Remove Moderator
                   </button>
                 </div>
               )}
 
+              {/* Delete Profile */}
               {isAdmin && (
                 <button
-                  disabled={isSelf}
-                  onClick={() => !isSelf && onDeleteUser?.(user.id)}
-                  className={`w-full py-2 rounded font-semibold mt-2 transition-colors active:scale-95 active:shadow-inner ${
+                  disabled={isSelf || adminActionLoading !== null}
+                  onClick={() => !isSelf && setShowDeleteConfirm(true)}
+                  className={`w-full py-2.5 px-4 rounded-xl font-bold text-sm mt-1 transition-all flex items-center justify-center gap-2 shadow-sm ${
                     isSelf
-                      ? "bg-red-900/40 text-white/40 cursor-not-allowed"
-                      : "bg-red-900/80 text-white hover:bg-red-800"
+                      ? "bg-red-950/30 text-red-300/40 cursor-not-allowed border border-red-900/20"
+                      : "bg-red-900/70 text-red-100 hover:bg-red-800 border border-red-600/50 active:scale-98"
                   }`}
                 >
-                  Delete Account {isSelf ? "(Cannot delete self)" : ""}
+                  <i className="fas fa-trash-alt"></i>
+                  Delete Profile (Permanent Soft Delete) {isSelf ? "(Cannot delete self)" : ""}
                 </button>
               )}
               
-              <div className="mt-2 pt-2 border-t border-[#1E293B]">
-                <p className="text-[#94A3B8] text-xs">
-                  Viewing as: <span className="font-semibold text-[#F8FAFC]">{isAdmin ? "Admin" : "Moderator"}</span>
-                </p>
-                <p className="text-[#94A3B8] text-xs mt-1">
-                  Profile Role: <span className="font-semibold text-[#F8FAFC] capitalize">{user.role || 'user'}</span>
-                </p>
+              <div className="mt-2 pt-3 border-t border-[#1E293B] flex items-center justify-between flex-wrap gap-2 text-xs text-[#94A3B8]">
+                <span>
+                  Viewing as: <strong className="text-white">{isAdmin ? "Admin" : "Moderator"}</strong>
+                </span>
                 {isSelf && (
-                  <p className="text-yellow-300 text-xs mt-1">
-                    ⚠️ Some actions disabled for your own account
-                  </p>
+                  <span className="text-yellow-400 font-semibold">
+                    ⚠️ Moderation actions disabled on your own account
+                  </span>
                 )}
               </div>
             </div>
@@ -2243,6 +2672,154 @@ export const UserProfile: React.FC<UserProfileProps> = ({
           onShare={() => {}}
           onOpenReactions={() => {}}
         />
+      )}
+
+      {/* Suspend Confirmation Modal */}
+      {showSuspendModal && showSuspendModal.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-[#0F172A] border border-[#1E293B] rounded-2xl p-5 max-w-md w-full shadow-2xl">
+            <div className="flex items-center justify-between pb-3 mb-3 border-b border-[#1E293B]">
+              <h3 className="text-base font-bold text-[#F8FAFC] flex items-center gap-2">
+                <i className="fas fa-pause text-yellow-400"></i>
+                {showSuspendModal.title}
+              </h3>
+              <button
+                onClick={() => setShowSuspendModal(null)}
+                className="text-[#94A3B8] hover:text-white p-1 rounded transition-colors"
+              >
+                <i className="fas fa-times"></i>
+              </button>
+            </div>
+
+            <p className="text-sm text-[#94A3B8] mb-3 leading-relaxed">
+              Are you sure you want to suspend <strong className="text-white">{(targetUser as any).name}</strong>?
+              {showSuspendModal.duration === "week" && " The user will be unable to post and will auto-return in 7 days."}
+              {showSuspendModal.duration === "month" && " The user will be unable to post and will auto-return in 30 days."}
+              {showSuspendModal.duration === "until_unsuspend" && " The user will be suspended indefinitely until manually unsuspended by an admin."}
+            </p>
+
+            <label className="block text-xs font-bold text-[#94A3B8] uppercase tracking-wider mb-1.5">
+              Reason for Suspension
+            </label>
+            <div className="flex gap-1.5 flex-wrap mb-2.5">
+              {["Spam", "Harassment", "Hate speech", "Scam", "Inappropriate content"].map((tag) => (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() => setSuspendReason(tag)}
+                  className={`px-2.5 py-1 rounded-full text-xs font-semibold border transition-all ${
+                    suspendReason === tag
+                      ? "bg-[#1877F2] text-white border-[#1877F2]"
+                      : "bg-[#1E293B] text-[#94A3B8] border-[#334155] hover:text-white"
+                  }`}
+                >
+                  {tag}
+                </button>
+              ))}
+            </div>
+            <input
+              type="text"
+              value={suspendReason}
+              onChange={(e) => setSuspendReason(e.target.value)}
+              placeholder="Enter reason (optional)"
+              className="w-full px-3 py-2 rounded-lg bg-[#1E293B] border border-[#334155] text-white text-sm focus:outline-none focus:border-[#1877F2] mb-4"
+            />
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowSuspendModal(null)}
+                className="px-4 py-2 rounded-lg bg-[#1E293B] text-[#94A3B8] hover:text-white text-sm font-semibold transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={adminActionLoading !== null}
+                onClick={() => handleModerate("suspend", { duration: showSuspendModal.duration, reason: suspendReason })}
+                className="px-4 py-2 rounded-lg bg-yellow-600 hover:bg-yellow-500 text-white text-sm font-bold transition-all flex items-center gap-2 active:scale-95 shadow-md"
+              >
+                {adminActionLoading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-pause"></i>}
+                Confirm Suspend
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-[#0F172A] border border-red-900/60 rounded-2xl p-5 max-w-md w-full shadow-2xl">
+            <div className="flex items-center gap-3 text-red-400 mb-3">
+              <div className="w-10 h-10 rounded-full bg-red-950/80 border border-red-700/60 flex items-center justify-center flex-shrink-0">
+                <i className="fas fa-trash-alt text-lg"></i>
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white">Delete Profile?</h3>
+                <p className="text-xs text-red-300">Permanent Soft Delete</p>
+              </div>
+            </div>
+
+            <p className="text-sm text-[#94A3B8] mb-4 leading-relaxed">
+              Are you sure you want to delete <strong className="text-white">{(targetUser as any).name}</strong>?
+              Login will be blocked immediately, and user data remains safely retained in the database.
+            </p>
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowDeleteConfirm(false)}
+                className="px-4 py-2 rounded-lg bg-[#1E293B] text-[#94A3B8] hover:text-white text-sm font-semibold transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={adminActionLoading !== null}
+                onClick={() => handleModerate("delete")}
+                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-bold transition-all flex items-center gap-2 active:scale-95 shadow-md"
+              >
+                {adminActionLoading ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-trash-alt"></i>}
+                Confirm Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Moderation Toast */}
+      {moderationToast && (
+        <div className="fixed top-5 left-1/2 -translate-x-1/2 z-50 max-w-md w-full px-4 animate-bounce">
+          <div
+            className={`flex items-center justify-between gap-3 p-3.5 rounded-xl shadow-2xl border text-sm font-semibold backdrop-blur-md ${
+              moderationToast.type === "success"
+                ? "bg-emerald-950/95 text-emerald-200 border-emerald-600/70"
+                : moderationToast.type === "error"
+                ? "bg-red-950/95 text-red-200 border-red-600/70"
+                : "bg-blue-950/95 text-blue-200 border-blue-600/70"
+            }`}
+          >
+            <div className="flex items-center gap-2.5">
+              <i
+                className={`fas ${
+                  moderationToast.type === "success"
+                    ? "fa-check-circle text-emerald-400"
+                    : moderationToast.type === "error"
+                    ? "fa-exclamation-circle text-red-400"
+                    : "fa-info-circle text-blue-400"
+                } text-base`}
+              ></i>
+              <span>{moderationToast.message}</span>
+            </div>
+            <button
+              onClick={() => setModerationToast(null)}
+              className="opacity-70 hover:opacity-100 p-1 transition-opacity"
+            >
+              <i className="fas fa-times"></i>
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

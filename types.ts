@@ -47,6 +47,8 @@ export interface User {
 
   is_verified?: boolean;
   role?: 'admin' | 'moderator' | 'user';
+  suspended_until?: string | null;
+  suspension_reason?: string | null;
 
   is_musician?: boolean;
   is_restricted?: boolean;

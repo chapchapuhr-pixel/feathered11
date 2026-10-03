@@ -26,6 +26,9 @@ const SUPER_ADMIN_ROLES = new Set(["admin", "superadmin"]);
 const DURATIONS: Record<string, number> = {
   week: 7,
   month: 30,
+  indefinite: 36500,
+  forever: 36500,
+  until_unsuspend: 36500,
 };
 
 export const onRequestOptions: PagesFunction = async () =>
@@ -186,6 +189,45 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
         suspended_until: expiresAt,
         reason: finalReason,
         soft_deleted: true,
+      });
+    }
+
+    // =========================================================
+    // MAKE MODERATOR / REMOVE MODERATOR
+    // =========================================================
+    if (action === "make_moderator" || action === "moderator") {
+      if (!isSuperAdmin) {
+        return json({ success: false, error: "Only admins can assign moderators" }, 403);
+      }
+
+      await env.DB
+        .prepare(`UPDATE users SET role = 'moderator' WHERE id = ?`)
+        .bind(targetId)
+        .run();
+
+      return json({
+        success: true,
+        action: "make_moderator",
+        user_id: targetId,
+        role: "moderator",
+      });
+    }
+
+    if (action === "remove_moderator") {
+      if (!isSuperAdmin) {
+        return json({ success: false, error: "Only admins can remove moderators" }, 403);
+      }
+
+      await env.DB
+        .prepare(`UPDATE users SET role = 'user' WHERE id = ?`)
+        .bind(targetId)
+        .run();
+
+      return json({
+        success: true,
+        action: "remove_moderator",
+        user_id: targetId,
+        role: "user",
       });
     }
 
